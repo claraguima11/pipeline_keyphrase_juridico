@@ -1,4 +1,4 @@
-# pipeline_keyphrase_juridico — guia das métricas
+# pipeline_keyphrase_juridico 
 
 ## Taxonomia de erro e o Automatic Judge (Nejadgholi et al., 2020)
 
