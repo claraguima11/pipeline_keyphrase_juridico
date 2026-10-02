@@ -22,7 +22,7 @@ Só que separar os tipos não resolve o problema de decidir quais são "aceitáv
 Com os tipos e o julgamento em mãos, dá pra montar várias versões do F1, cada uma "perdoando" um conjunto diferente de erros — e é exatamente essa diferença no que é perdoado que explica por que os números saem diferentes:
 
 - **Estrito**: só conta TP o acerto exato. É o F1 de sempre, o mais rígido — qualquer Type-3/4/5 conta como erro em cheio.
-- **Relaxado**: todo Type-5 já conta como TP, direto, sem nem passar pelo juiz. Por isso ele é o maior de todos — ele perdoa TODO erro de span com categoria certa, mesmo os que fazem pouco sentido.
+- **Relaxado**: todo Type-5 já conta como TP, direto, sem nem passar pelo juiz. Por isso ele é maior que o estrito e o learning-based, e ele perdoa TODO erro de span com categoria certa, mesmo os que fazem pouco sentido.
 - **Learning-based** (a proposta do paper): só os Type-5 que o juiz aceitou contam como TP; os que o juiz rejeitou continuam como erro. Por isso ele fica entre o estrito e o relaxado — ele só perdoa a parte dos Type-5 que o juiz validou, não todos.
 - **Estendido** (pedido extra do Flávio, não tá no paper): mesma lógica do learning-based, só que também perdoa os Type-3 e Type-4 que o juiz aceitar. Como ele perdoa mais tipos de erro que o learning-based, ele é sempre maior ou igual a ele.
 
