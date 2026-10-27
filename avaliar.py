@@ -1,38 +1,4 @@
-"""
-avaliar.py — entrada simples pro pipeline de avaliação.
 
-Recebe arquivos JSONL exportados do Doccano e devolve as métricas: tipos de erro
-(Type-1 a 5), F1 (estrito, relaxado, learning-based, estendido) e ranking
-(R-precision, MRR, Bpref).
-
-Dois jeitos de usar (Python / Colab):
-
-    from avaliar import avaliar
-
-    # 1) comparar dois arquivos: gold (referência) x predição. Não treina nada.
-    r = avaliar("gold.jsonl", "pred.jsonl")                  # F1 estrito e relaxado
-    r = avaliar("gold.jsonl", "pred.jsonl", usar_juiz=True)  # + learning-based e estendido
-
-    # 2) um arquivo só: treina o BERTimbau nos documentos e avalia no teste (precisa de GPU)
-    r = avaliar("gold.jsonl", labels="labels.json")
-
-Terminal:  python avaliar.py gold.jsonl pred.jsonl [--labels labels.json] [--juiz]
-
-Formato do JSONL (uma linha por documento, offsets de caractere):
-    {"text": "...", "label": [[inicio, fim, "Tipo"], ...], "meta": {"id_doc": "..."}}
-    - também aceita "entities": [{"start_offset", "end_offset", "label"}]
-    - no arquivo de predição, "text" pode faltar (usa o do gold) e a entidade pode ter score:
-      [inicio, fim, "Tipo", 0.93] -> habilita R-precision / MRR / Bpref
-    - os documentos dos dois arquivos são pareados por meta.id_doc (ou pela ordem das linhas)
-
-Arquivo de labels (opcional; sem ele os labels saem do próprio JSONL):
-    .json -> export de labels do Doccano (lista de {"text": "Tipo", ...}) ou lista de strings
-    .txt  -> um label por linha
-
-Antes de comparar, o texto vira palavras + tags BIO e é dividido em trechos de até
-`max_palavras` palavras. BIO só aceita uma tag por palavra: quando duas entidades de um mesmo
-arquivo se sobrepõem, fica a mais longa (a quantidade descartada é impressa).
-"""
 import json
 import random
 import re
@@ -40,11 +6,7 @@ from collections import Counter
 
 PALAVRA = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
-
-# ============================ leitura ============================
-
 def _limpar_label(nome):
-    # '-' separa B-/I- do tipo nas tags BIO, então não pode aparecer dentro do nome
     return str(nome).strip().replace("-", "_")
 
 
@@ -86,9 +48,7 @@ def ler_jsonl(caminho):
             id_doc = (d.get("meta") or {}).get("id_doc") or d.get("id") or f"doc{i}"
             docs.append((id_doc, d.get("text"), ents, scores))
     return docs
-
-
-# ============================ offsets -> tokens + BIO ============================
+    
 
 def sem_sobreposicao(ents):
     """Mantém a entidade mais longa quando duas se sobrepõem. Retorna (mantidas, n_descartadas)."""
@@ -145,7 +105,6 @@ def doc_para_exemplos(texto, entidades, max_palavras=100):
     tokens = [(m.group(), m.start(), m.end()) for m in PALAVRA.finditer(texto)]
     entidades, _ = sem_sobreposicao(entidades)
 
-    # cada token recebe o índice da entidade que o cobre (ou None)
     dono = [None] * len(tokens)
     for j, (ini, fim, _) in enumerate(entidades):
         for i, (_, t_ini, t_fim) in enumerate(tokens):
@@ -165,8 +124,6 @@ def doc_para_exemplos(texto, entidades, max_palavras=100):
         exemplos.append({"tokens": [t[0] for t in tokens[a:b]], "tags": tags})
     return exemplos
 
-
-# ============================ dataset ============================
 
 def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_teste=0.2, seed=42):
     """Equivalente ao `ner.carregar_dados()`, mas lendo o JSONL do Doccano.
@@ -218,8 +175,6 @@ def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_te
         }, features=features)
     return DatasetDict(splits), label_names
 
-
-# ============================ comparar dois arquivos ============================
 
 def _parear(docs_gold, docs_pred):
     """Pareia os documentos dos dois arquivos pelo id (meta.id_doc ou id); sem ids em comum,
@@ -310,8 +265,6 @@ def comparar(gold, pred, labels=None, max_palavras=100, usar_juiz=False, imprimi
         "resultados_juiz": resultados_juiz,
     }
 
-
-# ============================ pipeline completo ============================
 
 def avaliar(gold, pred=None, labels=None, max_palavras=100, usar_juiz=False, agregacao="media", seed=42):
     """Ponto de entrada.
