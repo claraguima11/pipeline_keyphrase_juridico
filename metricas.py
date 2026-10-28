@@ -253,6 +253,7 @@ def avaliar_ranking(tokens_por_frase, pred, agregacao="media", imprimir=True):
     for tokens_sent, labels_sent, preds_sent, conf_sent in zip(
             tokens_por_frase, pred["true_labels"], pred["true_predictions"], confiancas):
         ranking = montar_ranking(bio_para_entidades(preds_sent), conf_sent, tokens_sent, agregacao)
+        ranking = list(dict.fromkeys(ranking))   # mesmo texto repetido conta uma vez (mantém a maior confiança)
         gold_textos = {texto_da_entidade(ent, tokens_sent) for ent in bio_para_entidades(labels_sent)}
         lista_ranked_candidatos.append(ranking)
         lista_gold.append(gold_textos)
