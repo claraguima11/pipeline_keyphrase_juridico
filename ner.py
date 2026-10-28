@@ -78,8 +78,9 @@ def decodificar(logits, labels, label_names):
     return true_labels, true_predictions
 
 
-def treinar_ner(dataset_tokenizado, tokenizer, label_names, output_dir="./bertimbau-lener-br"):
-    """Fine-tuning do BERTimbau. Retorna o Trainer já treinado."""
+def treinar_ner(dataset_tokenizado, tokenizer, label_names, output_dir="./modelo-ner", epocas=3,
+                checkpoint=CHECKPOINT, lr=2e-5, batch_size=16):
+    """Fine-tuning de um modelo BERT-like (padrão: BERTimbau). Retorna o Trainer já treinado."""
     seqeval = evaluate.load("seqeval")
 
     def compute_metrics(eval_preds):
@@ -94,7 +95,7 @@ def treinar_ner(dataset_tokenizado, tokenizer, label_names, output_dir="./bertim
         }
 
     model = AutoModelForTokenClassification.from_pretrained(
-        CHECKPOINT,
+        checkpoint,
         num_labels=len(label_names),
         id2label={i: n for i, n in enumerate(label_names)},
         label2id={n: i for i, n in enumerate(label_names)},
@@ -103,10 +104,10 @@ def treinar_ner(dataset_tokenizado, tokenizer, label_names, output_dir="./bertim
         output_dir=output_dir,
         eval_strategy="epoch",
         save_strategy="epoch",
-        learning_rate=2e-5,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
-        num_train_epochs=3,
+        learning_rate=lr,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        num_train_epochs=epocas,
         weight_decay=0.01,
         load_best_model_at_end=True,
         metric_for_best_model="f1",
