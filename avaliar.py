@@ -1,12 +1,55 @@
+"""
+avaliar.py — entrada simples pro pipeline de avaliação.
 
+Recebe arquivos JSONL exportados do Doccano e devolve as métricas: tipos de erro
+(Type-1 a 5), F1 (estrito, relaxado, learning-based, estendido) e ranking
+(R-precision, MRR, Bpref).
+
+Dois jeitos de usar (Python / Colab):
+
+    from avaliar import avaliar
+
+    # 1) comparar dois arquivos: gold (referência) x predição. Não treina nada.
+    r = avaliar("gold.jsonl", "pred.jsonl")                  # F1 estrito e relaxado
+    r = avaliar("gold.jsonl", "pred.jsonl", usar_juiz=True)  # + learning-based e estendido
+
+    # 2) um arquivo só: treina o modelo nos documentos e avalia no teste (precisa de GPU)
+    r = avaliar("gold.jsonl", labels="labels.json")
+
+Terminal:  python avaliar.py gold.jsonl pred.jsonl [--labels labels.json] [--juiz]
+
+Formato do JSONL (uma linha por documento, offsets de caractere):
+    {"text": "...", "label": [[inicio, fim, "Tipo"], ...], "meta": {"id_doc": "..."}}
+    - também aceita "entities": [{"start_offset", "end_offset", "label"}]
+    - no arquivo de predição, "text" pode faltar (usa o do gold) e a entidade pode ter score:
+      [inicio, fim, "Tipo", 0.93] -> habilita R-precision / MRR / Bpref
+    - os documentos dos dois arquivos são pareados por meta.id_doc (ou pela ordem das linhas)
+
+Arquivo de labels (opcional; sem ele os labels saem do próprio JSONL):
+    .json -> export de labels do Doccano (lista de {"text": "Tipo", ...}) ou lista de strings
+    .txt  -> um label por linha
+
+Antes de comparar, o texto vira palavras + tags BIO e é dividido em trechos de até
+`max_palavras` palavras. BIO só aceita uma tag por palavra: quando duas entidades de um mesmo
+arquivo se sobrepõem, fica a mais longa (a quantidade descartada é impressa).
+"""
 import json
 import random
 import re
 from collections import Counter
 
+# Troque pelos equivalentes do idioma/domínio dos seus documentos (ex.: "bert-base-cased" e
+# "en_core_web_lg" pra inglês). O spaCy só é usado pelo juiz.
+MODELO_PADRAO = "neuralmind/bert-base-portuguese-cased"
+SPACY_PADRAO = "pt_core_news_lg"
+
 PALAVRA = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
+
+# ============================ leitura ============================
+
 def _limpar_label(nome):
+    # '-' separa B-/I- do tipo nas tags BIO, então não pode aparecer dentro do nome
     return str(nome).strip().replace("-", "_")
 
 
@@ -48,7 +91,9 @@ def ler_jsonl(caminho):
             id_doc = (d.get("meta") or {}).get("id_doc") or d.get("id") or f"doc{i}"
             docs.append((id_doc, d.get("text"), ents, scores))
     return docs
-    
+
+
+# ============================ offsets -> tokens + BIO ============================
 
 def sem_sobreposicao(ents):
     """Mantém a entidade mais longa quando duas se sobrepõem. Retorna (mantidas, n_descartadas)."""
@@ -71,14 +116,25 @@ def _paragrafos(texto, tokens):
     return grupos
 
 
-def _trechos(texto, tokens, max_palavras):
-    """Divide os tokens em janelas [ini, fim) de até max_palavras, juntando parágrafos curtos
-    e cortando parágrafos longos de preferência depois de pontuação final."""
+def _trechos(texto, tokens, limite, pesos=None):
+    """Divide os tokens em janelas [ini, fim) cujo peso total é <= limite. Peso de cada palavra =
+    nº de subtokens do BERT (ou 1 por palavra, se `pesos` for None). Junta parágrafos curtos e
+    corta parágrafos longos de preferência depois de pontuação final."""
+    if pesos is None:
+        pesos = [1] * len(tokens)
+
+    def peso(a, b):
+        return sum(pesos[a:b])
+
     pedacos = []
     for ini, fim in _paragrafos(texto, tokens):
-        while fim - ini > max_palavras:
-            corte = ini + max_palavras
-            for k in range(corte, max(ini + max_palavras // 2, ini + 1), -1):
+        while peso(ini, fim) > limite:
+            corte, acumulado = ini, 0
+            while corte < fim and acumulado + pesos[corte] <= limite:
+                acumulado += pesos[corte]
+                corte += 1
+            corte = max(corte, ini + 1)
+            for k in range(corte, max(ini + (corte - ini) // 2, ini), -1):
                 if tokens[k - 1][0] in {".", ";", ":"}:
                     corte = k
                     break
@@ -89,7 +145,7 @@ def _trechos(texto, tokens, max_palavras):
 
     janelas, atual = [], None
     for ini, fim in pedacos:
-        if atual and fim - atual[0] <= max_palavras and atual[1] == ini:
+        if atual and atual[1] == ini and peso(atual[0], fim) <= limite:
             atual = (atual[0], fim)
         else:
             if atual:
@@ -100,11 +156,15 @@ def _trechos(texto, tokens, max_palavras):
     return janelas
 
 
-def doc_para_exemplos(texto, entidades, max_palavras=100):
-    """Um documento -> lista de {'tokens': [...], 'tags': ['O', 'B-X', 'I-X', ...]}."""
+def doc_para_exemplos(texto, entidades, limite=100, contar=None):
+    """Um documento -> lista de {'tokens': [...], 'tags': ['O', 'B-X', 'I-X', ...]}.
+    `limite` = máx. de palavras por trecho; com `contar` (palavras -> nº de subtokens de cada
+    uma) o limite passa a ser em subtokens."""
     tokens = [(m.group(), m.start(), m.end()) for m in PALAVRA.finditer(texto)]
+    pesos = contar([t[0] for t in tokens]) if contar and tokens else None
     entidades, _ = sem_sobreposicao(entidades)
 
+    # cada token recebe o índice da entidade que o cobre (ou None)
     dono = [None] * len(tokens)
     for j, (ini, fim, _) in enumerate(entidades):
         for i, (_, t_ini, t_fim) in enumerate(tokens):
@@ -112,7 +172,7 @@ def doc_para_exemplos(texto, entidades, max_palavras=100):
                 dono[i] = j
 
     exemplos = []
-    for a, b in _trechos(texto, tokens, max_palavras):
+    for a, b in _trechos(texto, tokens, limite, pesos):
         tags, anterior = [], None
         for i in range(a, b):
             j = dono[i]
@@ -125,9 +185,14 @@ def doc_para_exemplos(texto, entidades, max_palavras=100):
     return exemplos
 
 
-def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_teste=0.2, seed=42):
+# ============================ dataset ============================
+
+def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_teste=0.2, seed=42,
+                     tokenizer=None, max_subtokens=400):
     """Equivalente ao `ner.carregar_dados()`, mas lendo o JSONL do Doccano.
-    Retorna (dataset, label_names) no mesmo formato que o resto do pipeline usa."""
+    Retorna (dataset, label_names) no mesmo formato que o resto do pipeline usa.
+    Com `tokenizer`, os trechos respeitam `max_subtokens` (o BERT aceita 512); sem ele,
+    `max_palavras`."""
     from datasets import ClassLabel, Dataset, DatasetDict, Features, Sequence, Value
 
     docs = ler_jsonl(jsonl)
@@ -137,11 +202,17 @@ def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_te
     nomes = ler_labels(labels) if labels else []
     achados = sorted({l for _, _, ents, _ in docs for _, _, l in ents})
     faltando = [l for l in achados if l not in nomes]
-    if faltando:
+    if faltando and labels:
         print("Aviso: labels no JSONL que não estão no arquivo de labels (adicionados):", faltando)
-        nomes += faltando
+    nomes += faltando
     label_names = ["O"] + [f"{p}-{l}" for l in nomes for p in ("B", "I")]
     tag2id = {t: i for i, t in enumerate(label_names)}
+
+    limite, contar = max_palavras, None
+    if tokenizer is not None:
+        limite = max_subtokens
+        contar = lambda palavras: [max(1, len(ids)) for ids in
+                                   tokenizer(palavras, add_special_tokens=False)["input_ids"]]
 
     descartadas = sum(sem_sobreposicao(e)[1] for _, _, e, _ in docs)
     total = sum(len(e) for _, _, e, _ in docs)
@@ -167,7 +238,7 @@ def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_te
         exemplos = []
         for i in indices:
             _, texto, ents, _ = docs[i]
-            exemplos.extend(doc_para_exemplos(texto, ents, max_palavras))
+            exemplos.extend(doc_para_exemplos(texto, ents, limite, contar))
         print(f"  {nome:10} {len(indices)} docs -> {len(exemplos)} trechos")
         splits[nome] = Dataset.from_dict({
             "tokens": [e["tokens"] for e in exemplos],
@@ -175,6 +246,8 @@ def carregar_doccano(jsonl, labels=None, max_palavras=100, prop_val=0.2, prop_te
         }, features=features)
     return DatasetDict(splits), label_names
 
+
+# ============================ comparar dois arquivos ============================
 
 def _parear(docs_gold, docs_pred):
     """Pareia os documentos dos dois arquivos pelo id (meta.id_doc ou id); sem ids em comum,
@@ -202,7 +275,8 @@ def _norm(texto):
     return " ".join(texto.split())
 
 
-def comparar(gold, pred, labels=None, max_palavras=100, usar_juiz=False, imprimir=True):
+def comparar(gold, pred, labels=None, max_palavras=100, usar_juiz=False, imprimir=True,
+             modelo=MODELO_PADRAO, spacy_model=SPACY_PADRAO):
     """Compara dois arquivos JSONL no formato do Doccano: `gold` (referência) e `pred`
     (o que está sendo avaliado). Não treina o NER.
 
@@ -243,7 +317,7 @@ def comparar(gold, pred, labels=None, max_palavras=100, usar_juiz=False, imprimi
     if usar_juiz:
         from juiz import Juiz
         dataset, label_names = carregar_doccano(gold, labels, max_palavras)
-        juiz = Juiz(dataset, label_names)
+        juiz = Juiz(dataset, label_names, spacy_model=spacy_model, checkpoint=modelo)
         juiz.treinar()
         resultados_juiz = juiz.avaliar_erros(detalhes)
 
@@ -266,13 +340,20 @@ def comparar(gold, pred, labels=None, max_palavras=100, usar_juiz=False, imprimi
     }
 
 
-def avaliar(gold, pred=None, labels=None, max_palavras=100, usar_juiz=False, agregacao="media", seed=42):
+# ============================ pipeline completo ============================
+
+def avaliar(gold, pred=None, labels=None, max_palavras=100, usar_juiz=False, agregacao="media", seed=42,
+            epocas=3, max_subtokens=400, modelo=MODELO_PADRAO, spacy_model=SPACY_PADRAO,
+            lr=2e-5, batch_size=16):
     """Ponto de entrada.
     - avaliar(gold, pred): compara dois JSONL do Doccano (ver `comparar`). Não treina nada.
-    - avaliar(gold): treina o BERTimbau nos documentos do `gold` e avalia no teste
-      (NER -> mismatches -> juiz -> 4 F1s -> ranking). Precisa de GPU (Colab)."""
+    - avaliar(gold): treina o modelo (padrão: BERTimbau) nos documentos do `gold` e avalia no teste
+      (NER -> mismatches -> juiz -> 4 F1s -> ranking). Precisa de GPU (Colab).
+      Com poucos documentos o modelo precisa de mais épocas pra aprender: tente epocas=15.
+    - modelo / spacy_model: troque pelos do idioma dos seus documentos; lr, batch_size, epocas
+      e max_subtokens também são ajustáveis."""
     if pred is not None:
-        return comparar(gold, pred, labels, max_palavras, usar_juiz)
+        return comparar(gold, pred, labels, max_palavras, usar_juiz, modelo=modelo, spacy_model=spacy_model)
     jsonl = gold
 
     import ner
@@ -281,22 +362,23 @@ def avaliar(gold, pred=None, labels=None, max_palavras=100, usar_juiz=False, agr
     from transformers import AutoTokenizer
 
     ner.fixar_seed(seed)
-    dataset, label_names = carregar_doccano(jsonl, labels, max_palavras, seed=seed)
-
-    tokenizer = AutoTokenizer.from_pretrained(ner.CHECKPOINT)
+    tokenizer = AutoTokenizer.from_pretrained(modelo)
+    dataset, label_names = carregar_doccano(jsonl, labels, max_palavras, seed=seed,
+                                            tokenizer=tokenizer, max_subtokens=max_subtokens)
     dataset_tok = ner.tokenizar_dataset(dataset, tokenizer)
-    trainer = ner.treinar_ner(dataset_tok, tokenizer, label_names)
+    trainer = ner.treinar_ner(dataset_tok, tokenizer, label_names, epocas=epocas,
+                              checkpoint=modelo, lr=lr, batch_size=batch_size)
     pred = ner.prever(trainer, dataset_tok, label_names)
 
     tokens_teste = dataset["test"]["tokens"]
     for i, (t, l) in enumerate(zip(tokens_teste, pred["true_labels"])):
         if len(t) != len(l):
             raise ValueError(f"Trecho {i} passou do limite do BERT e foi truncado; "
-                             f"diminua max_palavras (atual: {max_palavras}).")
+                             f"diminua max_subtokens (atual: {max_subtokens}).")
 
     detalhes = classificar_corpus(tokens_teste, pred["true_labels"], pred["true_predictions"])
 
-    juiz = Juiz(dataset, label_names)
+    juiz = Juiz(dataset, label_names, spacy_model=spacy_model, checkpoint=modelo)
     juiz.treinar()
     resultados_juiz = juiz.avaliar_erros(detalhes)
 
